@@ -23,6 +23,13 @@ invocations.
 This is NOT a general skill creator. It only handles multi-skill chains. For a single
 standalone skill, just write `~/.claude/skills/<name>/SKILL.md` directly.
 
+**Files in this skill:**
+- `SKILL.md` — this file (rules, templates, procedures)
+- `EXAMPLE.md` — a complete worked example: a real 3-phase `demo-*` chain with filled-in
+  state transitions. Read it when generating a new chain to pattern-match against.
+- `validate-chain.py` — standalone validator: YAML checks, handoff-graph walk, cycle /
+  orphan / dead-end detection. Prefer running it over improvising audit code.
+
 ---
 
 ## What a Skill Chain Is
@@ -118,10 +125,16 @@ root of the project being worked on — never inside `~/.claude/skills/`:
 
 ### State file format
 
+The header is **real YAML frontmatter** (wrapped in `---` fences), so phases can validate
+it mechanically with a YAML parser instead of line-grepping:
+
 ```markdown
+---
 task: "<original task description>"
 started: <ISO 8601 timestamp>
 status: phase-1-done | phase-2-done | complete
+chain_version: 1
+---
 
 ## Phase 1 — <name>
 **Output**: <what this phase produced>
@@ -130,6 +143,13 @@ status: phase-1-done | phase-2-done | complete
 ## Phase 2 — <name>
 ...
 ```
+
+`chain_version` is stamped by phase 1 and must match the version the chain's skills
+declare (put `Chain version: N` near the top of each phase's SKILL.md body). When you
+edit a chain in a way that changes the state format or status names, bump the version
+in every phase. A phase that finds a mismatched `chain_version` must abort — the state
+file was written by an older/incompatible edition of the chain and its sections may not
+mean what this phase expects.
 
 ### Rules
 
@@ -154,8 +174,10 @@ status: phase-1-done | phase-2-done | complete
    Never `sed -i` or append-in-place edit the live state file.
 6. **Validate the state file before trusting it** — a phase must not act on a state file
    it hasn't sanity-checked. Before doing any work:
-   - Confirm the file parses (has a `status:` line, has at least the frontmatter-style
-     key block at the top).
+   - Confirm the YAML frontmatter parses and contains `task`, `started`, `status`, and
+     `chain_version`.
+   - Confirm `chain_version` matches the version this phase's SKILL.md declares — abort
+     on mismatch (state written by an incompatible edition of the chain).
    - Confirm `status` is one of the values this chain's phases actually produce — not a
      typo, not a stale value from a chain that was since edited to use different status
      names.
@@ -164,6 +186,16 @@ status: phase-1-done | phase-2-done | complete
    - If any check fails, abort with a specific error naming what was expected vs. what
      was found. Do NOT guess or proceed on a malformed state file — that silently
      corrupts every phase after it.
+7. **One active session per chain per project** — chains assume a single session is
+   driving them. Atomic writes protect against interrupted writes, not against two
+   sessions (e.g., a background agent plus an interactive one) running phases
+   concurrently. Guard with a lock file next to the state file:
+   - At phase start, check for `.<chain-name>-state.lock`. If it exists, abort with
+     "Another session appears to be running this chain (lock file present). Remove
+     `.<chain-name>-state.lock` if that's stale."
+   - Create the lock file before doing work; delete it after the state update succeeds.
+   - The lock is advisory, not bulletproof — its job is to catch the common accident,
+     not to be a distributed mutex.
 
 ---
 
@@ -181,7 +213,7 @@ Place this at the very end of every SKILL.md, after the closing `---`:
 
 After completing this phase, output exactly:
 
-> Phase N complete. State written to `.my-chain-state.md`.
+> Phase N complete. State written to `.<chain-name>-state.md`.
 > Run `/<chain-name>-<next-phase>` to begin Phase N+1.
 
 Do not start the next phase. Do not offer to continue. Output only the handoff line
@@ -246,7 +278,20 @@ the next phase consume? Write this as a template before generating any skill fil
 
 For each phase, generate `~/.claude/skills/<chain-name>-<phase-name>/SKILL.md`.
 
-Each file must follow this structure:
+**Collision check first.** Before writing anything, check whether each target directory
+already exists:
+
+```bash
+ls -d ~/.claude/skills/<chain-name>-* 2>/dev/null
+```
+
+If any target directory exists, STOP and ask the user — it may be an unrelated skill
+that happens to share the name, or a previous version of this chain. Never silently
+overwrite an existing SKILL.md.
+
+Each file must follow this structure (`.<chain-name>-state.md` below is a placeholder —
+substitute the real chain name, e.g. `.deploy-check-state.md`; never leave a literal
+placeholder or example name in a generated skill):
 
 ```markdown
 ---
@@ -260,6 +305,8 @@ description: >
 
 # <Chain Name>: <Phase Display Name>
 
+Chain version: 1
+
 Phase N of N in the <chain-name> chain: <full chain map showing all phases>.
 
 ## Overview
@@ -270,7 +317,7 @@ Phase N of N in the <chain-name> chain: <full chain map showing all phases>.
 
 ### Step 1 — Load State
 
-Read `.my-chain-state.md` from the project root:
+Read `.<chain-name>-state.md` from the project root:
 
 - If missing: abort with "No state file found. Run `<chain-name>` first."
 - If the file doesn't parse (no `status:` line, malformed sections): abort with
@@ -302,7 +349,7 @@ append-in-place to the live file.
 
 After completing this phase, output exactly:
 
-> Phase N complete. State written to `.my-chain-state.md`.
+> Phase N complete. State written to `.<chain-name>-state.md`.
 > Run `/<chain-name>-<next-phase>` to begin Phase N+1.
 
 Do not start the next phase. Do not offer to continue. Output only the handoff line
@@ -311,15 +358,22 @@ and stop.
 
 ### Step 4 — Verify the Chain
 
-After generating all files, validate:
+After generating all files, run the bundled validator:
 
-- [ ] Every SKILL.md has clean YAML (parse with `python3 -c "import yaml; yaml.safe_load(open('SKILL.md').read().split('---')[1])"`)
+```bash
+python3 ~/.claude/skills/skill-system-creator/validate-chain.py <chain-name>
+```
+
+Then confirm by hand:
+
+- [ ] Every SKILL.md has clean YAML front matter
 - [ ] Phase 1 skill has NO "previous phase" check
-- [ ] Last phase skill has NO handoff (it says "Chain complete")
+- [ ] Last phase's handoff terminates ("Chain complete") instead of pointing to a next skill
 - [ ] Every intermediate phase has a handoff to the next
 - [ ] Handoff names match the actual skill directory names exactly
-- [ ] All skills reference the same state file path
+- [ ] All skills reference the same state file path (real chain name, no leftover placeholders)
 - [ ] All `status` values form a sequence (phase-1-done → phase-2-done → complete)
+- [ ] All phases declare the same `Chain version: N`
 
 ---
 
@@ -336,29 +390,63 @@ After generating all files, validate:
 
 ---
 
+## Deleting / Retiring a Chain
+
+Run this when the user says "delete the <chain-name> chain", "retire this chain", or
+"remove my <chain-name> skills".
+
+1. **Enumerate exactly what would be removed** — list the phase skill directories
+   (`~/.claude/skills/<chain-name>-*/`) and show the list to the user. Watch for
+   prefix-collision: confirm each directory is genuinely a phase of this chain (its
+   SKILL.md mentions the chain's state file or appears in the handoff graph) before
+   including it. Never sweep in an unrelated skill that merely shares the prefix.
+2. **Check for in-flight state** — search likely project roots (or ask the user which
+   projects used this chain) for `.<chain-name>-state.md` files whose `status` is not
+   `complete`. If any exist, warn: "Project <path> has a run mid-flight at
+   `<status>` — deleting the chain strands it." Let the user decide.
+3. **Confirm, then delete** — remove the phase directories only after explicit
+   confirmation of the exact list from step 1.
+4. **Clean up state files** — offer (don't assume) to delete leftover
+   `.<chain-name>-state.md` and `.<chain-name>-state.lock` files in the projects found
+   in step 2. Completed state files can be worth keeping as a record; that's the
+   user's call.
+5. **Report** — list every path deleted and every path deliberately left in place.
+
+---
+
 ## Listing Existing Chains
 
 Run this when the user says "what chains do I have", "list my chains", or similar —
 a quick inventory, distinct from the full **Chain Integrity Audit** below (no YAML
 parsing, no gap analysis, no report).
 
+Prefer the bundled validator in list mode — it detects chains from the actual handoff
+graph (which skill hands off to which), not from name guessing:
+
 ```bash
-ls ~/.claude/skills/ | sed -E 's/-[^-]+$//' | sort | uniq -c | sort -rn
+python3 ~/.claude/skills/skill-system-creator/validate-chain.py --list
 ```
 
-This groups skill directory names by shared prefix and counts members. Anything with
-count ≥ 2 is a likely chain. Present it as a flat list:
+If the script is unavailable, fall back to eyeballing the directory listing yourself:
+
+```bash
+ls ~/.claude/skills/
+```
+
+and group names that share a meaningful common prefix. Do NOT use a
+strip-the-last-hyphen-segment heuristic — multi-hyphen names like
+`skill-system-creator` or `uj-trace-fix-planner` mis-group badly under it. When two
+interpretations are plausible (is `myapp-helper` part of the `myapp` chain?), open the
+skill's handoff section and check whether anything actually hands off to it.
+
+Present the result as a flat list:
 
 ```markdown
 ## Chains found
 
-- `myapp-*` — 4 skills (scan, plan, implement, verify)
-- `otherchain-*` — 2 skills (fetch, summarize)
+- `myapp-*` — 4 skills (scan → plan → implement → verify)
+- `otherchain-*` — 2 skills (fetch → summarize)
 ```
-
-Note: prefix-grouping is a heuristic — a skill named `myapp-helper` that isn't
-actually part of the `myapp` chain will show up here too. If precision matters, tell
-the user to run the full audit instead.
 
 ---
 
@@ -374,7 +462,16 @@ ls ~/.claude/skills/*/SKILL.md
 
 ### Step 2 — Check YAML on Every File
 
+Prefer the bundled validator (it has a regex fallback when PyYAML is missing):
+
 ```bash
+python3 ~/.claude/skills/skill-system-creator/validate-chain.py --yaml-only
+```
+
+Or inline:
+
+```bash
+python3 -c "import yaml" 2>/dev/null || echo "PyYAML missing — run: pip3 install pyyaml"
 python3 -c "
 import os, yaml, glob
 errors = []
@@ -390,6 +487,10 @@ for f, e in errors:
     print(f'{f}: {e}')
 "
 ```
+
+If PyYAML can't be installed, do a crude sanity pass instead — check each front matter
+block has a `name:` line and a `description:` line and no unbalanced quotes — and say
+in the report that full YAML validation was skipped.
 
 Report every file with broken YAML and the specific error.
 
@@ -528,7 +629,10 @@ parsing colons inside the value.
 
 ### Pipeline Chain — Phase N Skill (intermediate)
 
-```markdown
+(The outer fence below uses four backticks because the template itself contains
+triple-backtick blocks. When writing the actual SKILL.md, use normal fences.)
+
+````markdown
 ---
 name: <chain-name>-<phase-name>
 description: >
@@ -539,13 +643,17 @@ description: >
 
 # <Chain-Name>: <Phase Display Name>
 
+Chain version: 1
+
 Phase N of N: <prev-phase> → **<this-phase>** → <next-phase>
 
 ## Load State
 
-Read `.my-chain-state.md`:
+Read `.<chain-name>-state.md`:
 
 - If missing → "No state file. Run `<chain-name>` first."
+- If frontmatter doesn't parse, or `chain_version` doesn't match this skill's declared
+  version → abort, state file is malformed or from an incompatible chain edition.
 - If status is not `<expected-status>` → "Expected `<expected-status>`, got `<actual>`.
   Run the previous phase first."
 - Otherwise proceed.
@@ -556,7 +664,7 @@ Read `.my-chain-state.md`:
 
 ## Update State
 
-Append to `.my-chain-state.md`:
+Atomically rewrite `.<chain-name>-state.md` (temp file + rename), appending:
 
 ```markdown
 ## Phase N — <Phase Display Name>
@@ -564,28 +672,28 @@ Append to `.my-chain-state.md`:
 **Key decisions**: <anything next phase must know>
 ```
 
-Update `status: <done-status>`.
+and updating `status: <done-status>` in the frontmatter.
 
 ## Handoff
 
 After completing, output exactly:
 
-> Phase N complete. State written to `.my-chain-state.md`.
+> Phase N complete. State written to `.<chain-name>-state.md`.
 > Run `/<chain-name>-<next-phase>` to begin Phase N+1.
 
 Do not start the next phase. Stop here.
-```
+````
 
 ### Pipeline Chain — Last Phase Skill
 
-Same as above, but replace handoff with:
+Same as above, but the handoff terminates instead of pointing to a next skill:
 
 ```markdown
 ## Handoff
 
 After completing, output exactly:
 
-> Chain complete! All N phases finished. State written to `.my-chain-state.md`.
+> Chain complete! All N phases finished. State written to `.<chain-name>-state.md`.
 > Run `<chain-name>` again to start a new session.
 
 Do not continue. Stop here.
@@ -593,9 +701,10 @@ Do not continue. Stop here.
 
 ### Orchestrator Chain — Master Skill
 
-For chains where one skill runs everything internally:
+For chains where one skill runs everything internally (four-backtick outer fence for
+the same reason as above):
 
-```markdown
+````markdown
 ---
 name: <chain-name>
 description: >
@@ -606,6 +715,8 @@ description: >
 ---
 
 # <Chain-Name>: <Display Name>
+
+Chain version: 1
 
 Fully autonomous. Runs all N phases in sequence without handoffs.
 
@@ -618,7 +729,7 @@ Fully autonomous. Runs all N phases in sequence without handoffs.
 
 ## State File
 
-Read and write `.my-chain-state.md` at the project root. Update `status` after each
+Read and write `.<chain-name>-state.md` at the project root. Update `status` after each
 internal phase so the chain can resume if interrupted.
 
 ## Phase 1 — <name>
@@ -633,7 +744,7 @@ internal phase so the chain can resume if interrupted.
 - State file exists, `status: complete` → Show last run summary
 - State file exists, `status: <partial>` → Resume from the incomplete phase
 - No state file, no task → "Provide a task: `/<chain-name> \"your task\"`"
-```
+````
 
 ---
 
