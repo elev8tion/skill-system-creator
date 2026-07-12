@@ -35,7 +35,13 @@ try:
 except ImportError:
     HAVE_YAML = False
 
-HANDOFF_RE = re.compile(r"(?:Run|invoke)\s+`/?([a-z0-9][a-z0-9_-]*)`", re.IGNORECASE)
+# Forward handoffs live only in the "## Handoff" section and use the canonical
+# "Run `/<skill>`" form (leading slash required). Abort messages ("Run `demo-scan`
+# first") and terminus restart hints ("Run `demo-scan` again") deliberately omit the
+# slash and/or live outside the Handoff section, so they never count as edges.
+RUN_HANDOFF_RE = re.compile(r"Run\s+`/([a-z0-9][a-z0-9_-]*)`")
+INVOKE_HANDOFF_RE = re.compile(r"invoke\s+`/?([a-z0-9][a-z0-9_-]*)`", re.IGNORECASE)
+HANDOFF_SECTION_RE = re.compile(r"^## Handoff\s*$", re.MULTILINE)
 STATE_FILE_RE = re.compile(r"`(\.[a-z0-9][a-z0-9_-]*-state\.md)`")
 CHAIN_COMPLETE_RE = re.compile(r"chain complete", re.IGNORECASE)
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -50,6 +56,7 @@ class SkillInfo:
         self.handoffs = []       # skill names this skill hands off to
         self.state_files = []    # state file paths referenced
         self.is_terminus = False
+        self.loose = False       # no ## Handoff section; edges inferred from prose
 
 
 def check_frontmatter(text, path):
@@ -91,7 +98,18 @@ def load_skills(skills_dir):
             continue
         info = SkillInfo(name, skill_md, body)
         info.yaml_error = check_frontmatter(body, skill_md)
-        info.handoffs = [t for t in HANDOFF_RE.findall(body) if t != name]
+        m = HANDOFF_SECTION_RE.search(body)
+        if m:
+            handoff_section = body[m.start():]
+            targets = RUN_HANDOFF_RE.findall(handoff_section)
+            targets += INVOKE_HANDOFF_RE.findall(handoff_section)
+        else:
+            # Legacy/non-conforming skill: no ## Handoff section. Infer edges from
+            # the whole body — may pick up abort-message references, so the audit
+            # marks these chains as loosely inferred.
+            info.loose = True
+            targets = RUN_HANDOFF_RE.findall(body)
+        info.handoffs = [t for t in targets if t != name]
         info.state_files = sorted(set(STATE_FILE_RE.findall(body)))
         info.is_terminus = bool(CHAIN_COMPLETE_RE.search(body))
         skills[name] = info
@@ -160,6 +178,13 @@ def find_cycles(members, skills):
 def audit_chain(members, skills, all_names):
     issues = []
     member_set = set(members)
+    loose_members = [m for m in members if skills[m].loose]
+    if loose_members:
+        issues.append(
+            "non-conforming (no '## Handoff' section, edges inferred from prose — "
+            "cycle/entry findings below may be false positives from abort messages): "
+            + ", ".join(loose_members)
+        )
     incoming = {m: 0 for m in members}
     for m in members:
         for t in skills[m].handoffs:
